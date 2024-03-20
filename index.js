@@ -1,12 +1,14 @@
+const fs = require('fs');
 const { PDFDocument } = require('pdf-lib');
 const { google } = require('googleapis');
+const https = require('https');
 const express = require('express');
 const bodyParser = require('body-parser');
-const app = express();
-const https = require('https');
+const { createServer } = require('http');
 const crypto = require('crypto');
-const { Readable } = require('stream');
+const path = require('path');
 
+const app = express();
 app.use(bodyParser.json());
 
 require('dotenv').config();
@@ -30,10 +32,11 @@ async function downloadFilesFromFolder(folderId, billType) {
 
     if (!res.data.files || res.data.files.length === 0) {
       console.log('No PDF files found in the specified folder.');
-      return null;
+      return;
     }
 
     const pdfDoc = await PDFDocument.create();
+
     const sortedFiles = res.data.files.sort((a, b) => a.name.localeCompare(b.name));
 
     const firstFileCreatedTime = new Date(sortedFiles[0].createdTime);
@@ -44,42 +47,72 @@ async function downloadFilesFromFolder(folderId, billType) {
     const firstFileName = sortedFiles[0].name.split(' ')[0];
     const lastFileName = sortedFiles[sortedFiles.length - 1].name.split(' ')[0];
 
-    const pdfName = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
+    const pdfPath = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
 
-    for (const file of res.data.files) {
+    for (const file of sortedFiles) {
+      const destPath = `${file.name}`;
+      const destStream = fs.createWriteStream(destPath);
       const response = await drive.files.get(
         { fileId: file.id, alt: 'media' },
-        { responseType: 'stream' } // Request stream type
+        { responseType: 'stream' }
       );
+      response.data.pipe(destStream);
+      await new Promise((resolve, reject) => {
+        destStream.on('finish', resolve);
+        destStream.on('error', reject);
+      });
 
-      const pdfStream = response.data; // Get the stream directly
-      const pdfBytes = await streamToBuffer(pdfStream); // Convert stream to buffer
-
+      const pdfBytes = fs.readFileSync(destPath);
       const externalPdfDoc = await PDFDocument.load(pdfBytes);
       const copiedPages = await pdfDoc.copyPages(externalPdfDoc, externalPdfDoc.getPageIndices());
       copiedPages.forEach(page => pdfDoc.addPage(page));
+
+      fs.unlinkSync(destPath);
     }
 
-    return [pdfDoc, pdfName];
+    const combinedPdfBytes = await pdfDoc.save();
+    fs.writeFileSync(pdfPath, combinedPdfBytes);
+    console.log('Combined PDF saved as:', pdfPath);
+
+    return pdfPath;
   } catch (error) {
-    console.error('Error downloading files:', error);
-    return null;
+    console.error('Error downloading or combining files:', error);
   }
 }
 
-async function sendPDFToGroup(pdfDoc, botToken, chatId, fileName) {
-  try {
-    const pdfBytes = await pdfDoc.save();
-    const pdfStream = new Readable();
-    pdfStream.push(pdfBytes);
-    pdfStream.push(null);
+async function uploadFileToFolder(filePath, folderId) {
+  const fileMetadata = {
+    name: path.basename(filePath),
+    parents: [folderId]
+  };
 
-    const boundary = '-----' + crypto.randomBytes(16).toString('hex');
+  const media = {
+    mimeType: 'application/pdf',
+    body: fs.createReadStream(filePath)
+  };
+
+  try {
+    const response = await drive.files.create({
+      requestBody: fileMetadata,
+      media: media,
+      fields: 'id'
+    });
+    console.log('File uploaded to Sales subfolder successfully with ID:', response.data.id);
+  } catch (error) {
+    console.error('Error uploading file to Sales subfolder:', error.message);
+  }
+}
+
+async function sendPDFToGroup(pdfPath, botToken, chatId) {
+  try {
+    const pdfBytes = fs.readFileSync(pdfPath);
+
+    const boundary = '-----' + Date.now();
     const data = `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
       `${chatId}\r\n` +
       `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="document"; filename=${fileName}\r\n` +
+      `Content-Disposition: form-data; name="document"; filename="${pdfPath}"\r\n` +
       `Content-Type: application/pdf\r\n\r\n`;
 
     const options = {
@@ -106,96 +139,144 @@ async function sendPDFToGroup(pdfDoc, botToken, chatId, fileName) {
     });
 
     req.write(data);
-    pdfStream.pipe(req, { end: false }); // Pipe the stream to the request
-    pdfStream.on('end', () => {
-      req.end(`\r\n--${boundary}--\r\n`);
-      console.log('PDF sent to Telegram group');
-    });
+    req.write(pdfBytes);
+    req.end(`\r\n--${boundary}--\r\n`);
+    console.log('PDF sent to Telegram group');
   } catch (error) {
     console.error('Error sending PDF:', error);
   }
 }
 
-async function streamToBuffer(stream) {
-  const chunks = [];
-  return new Promise((resolve, reject) => {
-    stream.on('data', chunk => chunks.push(chunk));
-    stream.on('error', reject);
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-  });
-}
 
-async function main(SP, botToken, chatId) {
+async function main(SP) {
   const folderId = process.env.FOLDERID;
-  const pdfDocs = await downloadFilesFromFolder(folderId, SP);
-  const pdfDoc = pdfDocs[0];
-  const fileName = pdfDocs[1];
-  if (pdfDoc) {
-    await sendPDFToGroup(pdfDoc, botToken, chatId, fileName);
-    const uploadFolderId = (fileName[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
+  const pdfPath = await downloadFilesFromFolder(folderId, SP);
 
-    // await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
-    return "Success";
-  } else {
-    return "Failed";
-  }
-}
+  if (pdfPath) {
+    const botToken = process.env.BOT_TOKEN;
+    const chatId = process.env.CHAT_ID;
 
-async function uploadFileToFolder(pdfDoc, folderId, fileName) {
-  const fileMetadata = {
-    name: fileName,
-    parents: [folderId]
-  };
+    const folderId = (pdfPath[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
 
-  const pdfBytes = await pdfDoc.save(); // Save the PDF document to get its bytes
-  const pdfStream = new Readable();
-  pdfStream.push(pdfBytes);
-  pdfStream.push(null); // Signal the end of the stream
+    const uploadPromise = uploadFileToFolder(pdfPath, folderId);
+    const sendPromise = sendPDFToGroup(pdfPath, botToken, chatId);
 
-  const media = {
-    mimeType: 'application/pdf',
-    body: pdfStream // Pass the readable stream as the body
-  };
+    await Promise.all([uploadPromise, sendPromise]);
 
-  const request = drive.files.create({
-    requestBody: fileMetadata,
-    media: media,
-    fields: 'id'
-  });
+    fs.unlinkSync(pdfPath);
 
-  pdfStream.on('error', err => {
-    console.error('PDF stream error:', err);
-    request.abort();
-  });
-
-  try {
-    // Pipe the PDF stream directly to the request stream
-    pdfStream.pipe(request, { end: true });
-
-    const response = await request;
-    console.log('File uploaded to Sales subfolder successfully with ID:', response.data.id);
-  } catch (error) {
-    console.error('Error uploading file to Sales subfolder:', error.message);
+    return "Success"
   }
 }
 
 
 
+const server = createServer(async (req, res) => {
+  if (req.method === 'GET' && req.url.startsWith('/pdf')) {
+    const SP = req.url.split('=')[1];
+    try {
+      const result = await main(SP);
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(result);
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(error.message);
+    }}
 
-app.get('/pdf', async (req, res) => {
-  const SP = req.query.SP;
-  const botToken = process.env.BOT_TOKEN;
-  const chatId = process.env.CHAT_ID;
+  else if (req.method === 'POST' && req.url === '/encrypt') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
 
-  try {
-    const result = await main(SP, botToken, chatId);
-    res.send(result);
-  } catch (error) {
-    res.status(500).send(error.message);
-  }
-});
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const encryptedData = encryptWithRSA(data.text);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ encryptedData }));
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid request' }));
+      }
+    });
+  } else if (req.method === 'POST' && req.url === '/encrypt-by-key') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const encryptedData = encryptBySymmetricKey(data.jsonData, data.decryptedSek);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ encryptedData }));
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid request' }));
+      }
+    });
+  } else if (req.method === 'POST' && req.url === '/decrypt-sek') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const decryptedSek = decryptSekWithAppKey(data.encryptedSek, data.base64AppKey);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ decryptedSek }));
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid request' }));
+      }
+    });
+  } else if (req.method === 'GET' && req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Hello, World!');
+    } else {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not Found' }));
+    }
+    });
+
+    function encryptWithRSA(data) {
+    const publicKeyPath = 'public_key.pem';
+
+    // Load the public key from the given file path
+    const pemData = fs.readFileSync(publicKeyPath);
+    const publicKey = crypto.createPublicKey(pemData);
+
+    const encryptedData = crypto.publicEncrypt({
+      key: publicKey,
+      padding: crypto.constants.RSA_PKCS1_PADDING
+    }, Buffer.from(data, 'utf-8'));
+
+    return encryptedData.toString('base64');
+    }
+
+    function encryptBySymmetricKey(jsonData, decryptedSek) {
+    const sekByte = Buffer.from(decryptedSek, 'base64');
+    const aesKey = crypto.createCipheriv('aes-256-ecb', sekByte, '');
+    let encryptedJson = aesKey.update(jsonData, 'utf-8', 'base64');
+    encryptedJson += aesKey.final('base64');
+    return encryptedJson;
+    }
+
+    function decryptSekWithAppKey(encryptedSek, base64AppKey) {
+    const appKey = Buffer.from(base64AppKey, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-ecb', appKey, '');
+    let decryptedSek = decipher.update(encryptedSek, 'base64', 'utf-8');
+    decryptedSek += decipher.final('utf-8');
+    return decryptedSek;
+    }
+
+    const PORT = process.env.PORT || 3000;
+    server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    });
+
+
