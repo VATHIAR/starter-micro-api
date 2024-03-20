@@ -1,14 +1,12 @@
-const fs = require('fs');
 const { PDFDocument } = require('pdf-lib');
 const { google } = require('googleapis');
-const https = require('https');
 const express = require('express');
 const bodyParser = require('body-parser');
-const { createServer } = require('http');
-const crypto = require('crypto');
-const path = require('path');
-
 const app = express();
+const https = require('https');
+const crypto = require('crypto');
+const { Readable } = require('stream');
+
 app.use(bodyParser.json());
 
 require('dotenv').config();
@@ -32,11 +30,10 @@ async function downloadFilesFromFolder(folderId, billType) {
 
     if (!res.data.files || res.data.files.length === 0) {
       console.log('No PDF files found in the specified folder.');
-      return;
+      return null;
     }
 
     const pdfDoc = await PDFDocument.create();
-
     const sortedFiles = res.data.files.sort((a, b) => a.name.localeCompare(b.name));
 
     const firstFileCreatedTime = new Date(sortedFiles[0].createdTime);
@@ -44,75 +41,45 @@ async function downloadFilesFromFolder(folderId, billType) {
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const formattedDate = monthNames[firstFileCreatedTime.getMonth()] + firstFileCreatedTime.getFullYear();
 
+
+
     const firstFileName = sortedFiles[0].name.split(' ')[0];
     const lastFileName = sortedFiles[sortedFiles.length - 1].name.split(' ')[0];
 
-    const pdfPath = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
+    const pdfName = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
 
-    for (const file of sortedFiles) {
-      const destPath = `${file.name}`;
-      const destStream = fs.createWriteStream(destPath);
+
+
+    for (const file of res.data.files) {
       const response = await drive.files.get(
         { fileId: file.id, alt: 'media' },
-        { responseType: 'stream' }
+        { responseType: 'arraybuffer' } // Request array buffer type
       );
-      response.data.pipe(destStream);
-      await new Promise((resolve, reject) => {
-        destStream.on('finish', resolve);
-        destStream.on('error', reject);
-      });
 
-      const pdfBytes = fs.readFileSync(destPath);
+      const pdfBytes = response.data; // Get the array buffer directly
+
       const externalPdfDoc = await PDFDocument.load(pdfBytes);
       const copiedPages = await pdfDoc.copyPages(externalPdfDoc, externalPdfDoc.getPageIndices());
       copiedPages.forEach(page => pdfDoc.addPage(page));
-
-      fs.unlinkSync(destPath);
     }
 
-    const combinedPdfBytes = await pdfDoc.save();
-    fs.writeFileSync(pdfPath, combinedPdfBytes);
-    console.log('Combined PDF saved as:', pdfPath);
-
-    return pdfPath;
+    return [pdfDoc, pdfName];
   } catch (error) {
-    console.error('Error downloading or combining files:', error);
+    console.error('Error downloading files:', error);
+    return null;
   }
 }
 
-async function uploadFileToFolder(filePath, folderId) {
-  const fileMetadata = {
-    name: path.basename(filePath),
-    parents: [folderId]
-  };
-
-  const media = {
-    mimeType: 'application/pdf',
-    body: fs.createReadStream(filePath)
-  };
-
+async function sendPDFToGroup(pdfDoc, botToken, chatId, fileName) {
   try {
-    const response = await drive.files.create({
-      requestBody: fileMetadata,
-      media: media,
-      fields: 'id'
-    });
-    console.log('File uploaded to Sales subfolder successfully with ID:', response.data.id);
-  } catch (error) {
-    console.error('Error uploading file to Sales subfolder:', error.message);
-  }
-}
+    const pdfBytes = await pdfDoc.save();
 
-async function sendPDFToGroup(pdfPath, botToken, chatId) {
-  try {
-    const pdfBytes = fs.readFileSync(pdfPath);
-
-    const boundary = '-----' + Date.now();
+    const boundary = '-----' + crypto.randomBytes(16).toString('hex');
     const data = `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
       `${chatId}\r\n` +
       `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="document"; filename="${pdfPath}"\r\n` +
+      `Content-Disposition: form-data; name="document"; filename=${fileName}\r\n` +
       `Content-Type: application/pdf\r\n\r\n`;
 
     const options = {
@@ -147,136 +114,67 @@ async function sendPDFToGroup(pdfPath, botToken, chatId) {
   }
 }
 
-
-async function main(SP) {
+async function main(SP, botToken, chatId) {
   const folderId = process.env.FOLDERID;
-  const pdfPath = await downloadFilesFromFolder(folderId, SP);
+  const pdfDocs = await downloadFilesFromFolder(folderId, SP);
+  const pdfDoc = pdfDocs[0];
+  const fileName = pdfDocs[1];
+  if (pdfDoc) {
+    await sendPDFToGroup(pdfDoc, botToken, chatId,fileName);
+    const uploadFolderId = (fileName[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
 
-  if (pdfPath) {
-    const botToken = process.env.BOT_TOKEN;
-    const chatId = process.env.CHAT_ID;
+    await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
+    return "Success";
+  } else {
+    return "Failed";
+  }
+}
 
-    const folderId = (pdfPath[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
+async function uploadFileToFolder(pdfDoc, folderId, fileName) {
+  const fileMetadata = {
+    name: fileName,
+    parents: [folderId]
+  };
 
-    const uploadPromise = uploadFileToFolder(pdfPath, folderId);
-    const sendPromise = sendPDFToGroup(pdfPath, botToken, chatId);
+  const pdfBytes = await pdfDoc.save(); // Save the PDF document to get its bytes
+  const pdfStream = new Readable();
+  pdfStream.push(pdfBytes);
+  pdfStream.push(null); // Signal the end of the stream
 
-    await Promise.all([uploadPromise, sendPromise]);
+  const media = {
+    mimeType: 'application/pdf',
+    body: pdfStream // Pass the readable stream as the body
+  };
 
-    fs.unlinkSync(pdfPath);
-
-    return "Success"
+  try {
+    const response = await drive.files.create({
+      requestBody: fileMetadata,
+      media: media,
+      fields: 'id'
+    });
+    console.log('File uploaded to Sales subfolder successfully with ID:', response.data.id);
+  } catch (error) {
+    console.error('Error uploading file to Sales subfolder:', error.message);
   }
 }
 
 
 
-const server = createServer(async (req, res) => {
-  if (req.method === 'GET' && req.url.startsWith('/pdf')) {
-    const SP = req.url.split('=')[1];
-    try {
-      const result = await main(SP);
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end(result);
-    } catch (error) {
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end(error.message);
-    }}
 
-  else if (req.method === 'POST' && req.url === '/encrypt') {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
+app.get('/pdf', async (req, res) => {
+  const SP = req.query.SP;
+  const botToken = process.env.BOT_TOKEN;
+  const chatId = process.env.CHAT_ID;
 
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const encryptedData = encryptWithRSA(data.text);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ encryptedData }));
-      } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid request' }));
-      }
-    });
-  } else if (req.method === 'POST' && req.url === '/encrypt-by-key') {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
+  try {
+    const result = await main(SP, botToken, chatId);
+    res.send(result);
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
 
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const encryptedData = encryptBySymmetricKey(data.jsonData, data.decryptedSek);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ encryptedData }));
-      } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid request' }));
-      }
-    });
-  } else if (req.method === 'POST' && req.url === '/decrypt-sek') {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
-
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const decryptedSek = decryptSekWithAppKey(data.encryptedSek, data.base64AppKey);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ decryptedSek }));
-      } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid request' }));
-      }
-    });
-  } else if (req.method === 'GET' && req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Hello, World!');
-    } else {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not Found' }));
-    }
-    });
-
-    function encryptWithRSA(data) {
-    const publicKeyPath = 'public_key.pem';
-
-    // Load the public key from the given file path
-    const pemData = fs.readFileSync(publicKeyPath);
-    const publicKey = crypto.createPublicKey(pemData);
-
-    const encryptedData = crypto.publicEncrypt({
-      key: publicKey,
-      padding: crypto.constants.RSA_PKCS1_PADDING
-    }, Buffer.from(data, 'utf-8'));
-
-    return encryptedData.toString('base64');
-    }
-
-    function encryptBySymmetricKey(jsonData, decryptedSek) {
-    const sekByte = Buffer.from(decryptedSek, 'base64');
-    const aesKey = crypto.createCipheriv('aes-256-ecb', sekByte, '');
-    let encryptedJson = aesKey.update(jsonData, 'utf-8', 'base64');
-    encryptedJson += aesKey.final('base64');
-    return encryptedJson;
-    }
-
-    function decryptSekWithAppKey(encryptedSek, base64AppKey) {
-    const appKey = Buffer.from(base64AppKey, 'base64');
-    const decipher = crypto.createDecipheriv('aes-256-ecb', appKey, '');
-    let decryptedSek = decipher.update(encryptedSek, 'base64', 'utf-8');
-    decryptedSek += decipher.final('utf-8');
-    return decryptedSek;
-    }
-
-    const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    });
-
-
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
