@@ -119,10 +119,11 @@ async function main(SP, botToken, chatId) {
   const pdfDocs = await downloadFilesFromFolder(folderId, SP);
   const pdfDoc = pdfDocs[0];
   const fileName = pdfDocs[1];
+  console.log("fileName");
   if (pdfDoc) {
+    console.log(fileName);
     await sendPDFToGroup(pdfDoc, botToken, chatId,fileName);
     const uploadFolderId = (fileName[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
-
     await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
     return "Success";
   } else {
