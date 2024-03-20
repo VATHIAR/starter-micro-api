@@ -41,22 +41,19 @@ async function downloadFilesFromFolder(folderId, billType) {
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const formattedDate = monthNames[firstFileCreatedTime.getMonth()] + firstFileCreatedTime.getFullYear();
 
-
-
     const firstFileName = sortedFiles[0].name.split(' ')[0];
     const lastFileName = sortedFiles[sortedFiles.length - 1].name.split(' ')[0];
 
     const pdfName = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
 
-
-
     for (const file of res.data.files) {
       const response = await drive.files.get(
         { fileId: file.id, alt: 'media' },
-        { responseType: 'arraybuffer' } // Request array buffer type
+        { responseType: 'stream' } // Request stream type
       );
 
-      const pdfBytes = response.data; // Get the array buffer directly
+      const pdfStream = response.data; // Get the stream directly
+      const pdfBytes = await streamToBuffer(pdfStream); // Convert stream to buffer
 
       const externalPdfDoc = await PDFDocument.load(pdfBytes);
       const copiedPages = await pdfDoc.copyPages(externalPdfDoc, externalPdfDoc.getPageIndices());
@@ -73,6 +70,9 @@ async function downloadFilesFromFolder(folderId, billType) {
 async function sendPDFToGroup(pdfDoc, botToken, chatId, fileName) {
   try {
     const pdfBytes = await pdfDoc.save();
+    const pdfStream = new Readable();
+    pdfStream.push(pdfBytes);
+    pdfStream.push(null);
 
     const boundary = '-----' + crypto.randomBytes(16).toString('hex');
     const data = `--${boundary}\r\n` +
@@ -106,12 +106,23 @@ async function sendPDFToGroup(pdfDoc, botToken, chatId, fileName) {
     });
 
     req.write(data);
-    req.write(pdfBytes);
-    req.end(`\r\n--${boundary}--\r\n`);
-    console.log('PDF sent to Telegram group');
+    pdfStream.pipe(req, { end: false }); // Pipe the stream to the request
+    pdfStream.on('end', () => {
+      req.end(`\r\n--${boundary}--\r\n`);
+      console.log('PDF sent to Telegram group');
+    });
   } catch (error) {
     console.error('Error sending PDF:', error);
   }
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+  });
 }
 
 async function main(SP, botToken, chatId) {
@@ -119,12 +130,11 @@ async function main(SP, botToken, chatId) {
   const pdfDocs = await downloadFilesFromFolder(folderId, SP);
   const pdfDoc = pdfDocs[0];
   const fileName = pdfDocs[1];
-  console.log("fileName");
   if (pdfDoc) {
-    console.log(fileName);
-    await sendPDFToGroup(pdfDoc, botToken, chatId,fileName);
+    await sendPDFToGroup(pdfDoc, botToken, chatId, fileName);
     const uploadFolderId = (fileName[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
-    await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
+
+    // await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
     return "Success";
   } else {
     return "Failed";
@@ -147,12 +157,22 @@ async function uploadFileToFolder(pdfDoc, folderId, fileName) {
     body: pdfStream // Pass the readable stream as the body
   };
 
+  const request = drive.files.create({
+    requestBody: fileMetadata,
+    media: media,
+    fields: 'id'
+  });
+
+  pdfStream.on('error', err => {
+    console.error('PDF stream error:', err);
+    request.abort();
+  });
+
   try {
-    const response = await drive.files.create({
-      requestBody: fileMetadata,
-      media: media,
-      fields: 'id'
-    });
+    // Pipe the PDF stream directly to the request stream
+    pdfStream.pipe(request, { end: true });
+
+    const response = await request;
     console.log('File uploaded to Sales subfolder successfully with ID:', response.data.id);
   } catch (error) {
     console.error('Error uploading file to Sales subfolder:', error.message);
