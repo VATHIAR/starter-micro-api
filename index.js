@@ -6,9 +6,7 @@ const app = express();
 const https = require('https');
 const crypto = require('crypto');
 const { Readable } = require('stream');
-const AWS = require('aws-sdk');
 
-const s3 = new AWS.S3();
 app.use(bodyParser.json());
 
 require('dotenv').config();
@@ -24,113 +22,107 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: 'v3', auth });
 
 async function downloadFilesFromFolder(folderId, billType) {
-    try {
-        const res = await drive.files.list({
-            q: `'${folderId}' in parents and name starts with '${billType}' and mimeType='application/pdf'`,
-            fields: 'files(id, name, createdTime)'
-        });
+  try {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and name starts with '${billType}' and mimeType='application/pdf'`,
+      fields: 'files(id, name, createdTime)'
+    });
 
-        if (!res.data.files || res.data.files.length === 0) {
-            console.log('No PDF files found in the specified folder.');
-            return;
-        }
-
-        const pdfDoc = await PDFDocument.create();
-
-        const sortedFiles = res.data.files.sort((a, b) => a.name.localeCompare(b.name));
-
-        const firstFileCreatedTime = new Date(sortedFiles[0].createdTime);
-        const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-        const formattedDate = monthNames[firstFileCreatedTime.getMonth()] + firstFileCreatedTime.getFullYear();
-
-        const firstFileName = sortedFiles[0].name.split(' ')[0];
-        const lastFileName = sortedFiles[sortedFiles.length - 1].name.split(' ')[0];
-
-        const pdfPath = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
-
-        for (const file of sortedFiles) {
-            const response = await drive.files.get(
-                { fileId: file.id, alt: 'media' },
-                { responseType: 'stream' }
-            );
-            const pdfBytes = await new Promise((resolve, reject) => {
-                const chunks = [];
-                response.data.on('data', chunk => chunks.push(chunk));
-                response.data.on('end', () => resolve(Buffer.concat(chunks)));
-                response.data.on('error', reject);
-            });
-
-            const externalPdfDoc = await PDFDocument.load(pdfBytes);
-            const copiedPages = await pdfDoc.copyPages(externalPdfDoc, externalPdfDoc.getPageIndices());
-            copiedPages.forEach(page => pdfDoc.addPage(page));
-        }
-
-        const combinedPdfBytes = await pdfDoc.save();
-        return combinedPdfBytes;
-    } catch (error) {
-        console.error('Error downloading files:', error);
-        throw error;
+    if (!res.data.files || res.data.files.length === 0) {
+      console.log('No PDF files found in the specified folder.');
+      return null;
     }
+
+    const pdfDoc = await PDFDocument.create();
+    const sortedFiles = res.data.files.sort((a, b) => a.name.localeCompare(b.name));
+
+    const firstFileCreatedTime = new Date(sortedFiles[0].createdTime);
+    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const formattedDate = monthNames[firstFileCreatedTime.getMonth()] + firstFileCreatedTime.getFullYear();
+
+    const firstFileName = sortedFiles[0].name.split(' ')[0];
+    const lastFileName = sortedFiles[sortedFiles.length - 1].name.split(' ')[0];
+
+    const pdfName = `${firstFileName}-${lastFileName} [${sortedFiles.length}] ${formattedDate}.pdf`;
+
+    for (const file of res.data.files) {
+      const response = await drive.files.get(
+        { fileId: file.id, alt: 'media' },
+        { responseType: 'stream' } // Request stream type
+      );
+
+      const pdfStream = response.data; // Get the stream directly
+      const pdfBytes = await streamToBuffer(pdfStream); // Convert stream to buffer
+
+      const externalPdfDoc = await PDFDocument.load(pdfBytes);
+      const copiedPages = await pdfDoc.copyPages(externalPdfDoc, externalPdfDoc.getPageIndices());
+      copiedPages.forEach(page => pdfDoc.addPage(page));
+    }
+
+    return [pdfDoc, pdfName];
+  } catch (error) {
+    console.error('Error downloading files:', error);
+    return null;
+  }
 }
 
-async function uploadFileToFolder(fileData, fileName) {
-    const params = {
-        Bucket: 'cyclic-clever-goat-sweatsuit-ap-northeast-1',
-        Key: fileName,
-        Body: fileData
+async function sendPDFToGroup(pdfDoc, botToken, chatId, fileName) {
+  try {
+    const pdfBytes = await pdfDoc.save();
+    const pdfStream = new Readable();
+    pdfStream.push(pdfBytes);
+    pdfStream.push(null);
+
+    const boundary = '-----' + crypto.randomBytes(16).toString('hex');
+    const data = `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
+      `${chatId}\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="document"; filename=${fileName}\r\n` +
+      `Content-Type: application/pdf\r\n\r\n`;
+
+    const options = {
+      method: 'POST',
+      hostname: 'api.telegram.org',
+      path: `/bot${botToken}/sendDocument`,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`
+      }
     };
-    try {
-        const data = await s3.upload(params).promise();
-        console.log('File uploaded to S3:', data.Location);
-        return data.Location;
-    } catch (error) {
-        console.error('Error uploading file to S3:', error);
-        throw error;
-    }
+
+    const req = https.request(options, res => {
+      let responseData = '';
+      res.on('data', chunk => {
+        responseData += chunk;
+      });
+      res.on('end', () => {
+        console.log('Response:', responseData);
+      });
+    });
+
+    req.on('error', error => {
+      console.error('Error sending PDF:', error);
+    });
+
+    req.write(data);
+    pdfStream.pipe(req, { end: false }); // Pipe the stream to the request
+    pdfStream.on('end', () => {
+      req.end(`\r\n--${boundary}--\r\n`);
+      console.log('PDF sent to Telegram group');
+    });
+  } catch (error) {
+    console.error('Error sending PDF:', error);
+  }
 }
 
-async function sendPDFToGroup(pdfData, botToken, chatId) {
-    try {
-        const boundary = '-----' + Date.now();
-        const data = `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
-            `${chatId}\r\n` +
-            `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="document"; filename="file.pdf"\r\n` +
-            `Content-Type: application/pdf\r\n\r\n`;
-
-        const options = {
-            method: 'POST',
-            hostname: 'api.telegram.org',
-            path: `/bot${botToken}/sendDocument`,
-            headers: {
-                'Content-Type': `multipart/form-data; boundary=${boundary}`
-            }
-        };
-
-        const req = https.request(options, res => {
-            let responseData = '';
-            res.on('data', chunk => {
-                responseData += chunk;
-            });
-            res.on('end', () => {
-                console.log('Response:', responseData);
-            });
-        });
-
-        req.on('error', error => {
-            console.error('Error sending PDF:', error);
-        });
-
-        req.write(data);
-        req.write(pdfData);
-        req.end(`\r\n--${boundary}--\r\n`);
-        console.log('PDF sent to Telegram group');
-    } catch (error) {
-        console.error('Error sending PDF:', error);
-        throw error;
-    }
+async function streamToBuffer(stream) {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+  });
 }
 
 async function main(SP, botToken, chatId) {
@@ -139,10 +131,10 @@ async function main(SP, botToken, chatId) {
   const pdfDoc = pdfDocs[0];
   const fileName = pdfDocs[1];
   if (pdfDoc) {
-    await sendPDFToGroup(pdfDoc, botToken, chatId);
+    await sendPDFToGroup(pdfDoc, botToken, chatId,fileName);
     const uploadFolderId = (fileName[0] == "P") ? "1svKwt6HpogrwQwxMegoS-QQ1PB852qd1" : "1BRVVV76DFjN3vv8Giymlt8rl0IO9Kmf0";
 
-    // await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
+    await uploadFileToFolder(pdfDoc, uploadFolderId, fileName);
     return "Success";
   } else {
     return "Failed";
@@ -165,22 +157,12 @@ async function uploadFileToFolder(pdfDoc, folderId, fileName) {
     body: pdfStream // Pass the readable stream as the body
   };
 
-  const request = drive.files.create({
-    requestBody: fileMetadata,
-    media: media,
-    fields: 'id'
-  });
-
-  pdfStream.on('error', err => {
-    console.error('PDF stream error:', err);
-    request.abort();
-  });
-
   try {
-    // Pipe the PDF stream directly to the request stream
-    pdfStream.pipe(request, { end: true });
-
-    const response = await request;
+    const response = await drive.files.create({
+      requestBody: fileMetadata,
+      media: media,
+      fields: 'id'
+    });
     console.log('File uploaded to Sales subfolder successfully with ID:', response.data.id);
   } catch (error) {
     console.error('Error uploading file to Sales subfolder:', error.message);
